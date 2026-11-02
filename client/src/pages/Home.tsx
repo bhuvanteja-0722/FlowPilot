@@ -28,16 +28,16 @@ import {
   Store,
   TrendingDown,
   TrendingUp,
-  Users,
   WalletCards,
   X,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 
-type TransactionStatus = "Paid" | "Pending" | "Refunded" | "Dispute";
+type TransactionStatus = "Paid" | "Pending" | "Refunded" | "Dispute" | "Declined";
 type RiskLevel = "Low" | "Watch" | "High";
 type FilterKey = "all" | "inflow" | "outflow" | "risk";
+type StatusFilter = "any" | "pending" | "attention" | "settled";
 type ActionKind = "refund" | "remind";
 
 interface Transaction {
@@ -47,7 +47,7 @@ interface Transaction {
   email: string;
   amount: number;
   fee: number;
-  type: "Sale" | "Refund" | "Dispute";
+  type: "Sale" | "Refund" | "Dispute" | "Declined";
   status: TransactionStatus;
   risk: RiskLevel;
   date: string;
@@ -169,6 +169,47 @@ const navItems = [
   { label: "Insights", icon: Sparkles, count: "3" },
 ];
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+
+interface SandboxRecord {
+  id: string;
+  amount: number;
+  currency: string;
+  status: "Paid" | "Pending" | "Refunded" | "Declined";
+  customer: string;
+  item: string;
+  date: string;
+  time: string;
+  fee: number;
+  risk: RiskLevel;
+  note: string;
+}
+
+interface LiveBrief {
+  summary: string;
+  provider: string;
+  model: string;
+  insights: Array<{
+    title: string;
+    summary: string;
+    priority: "high" | "medium" | "low";
+    recommendedAction: "review" | "capture" | "remind";
+  }>;
+}
+
+function toTransaction(record: SandboxRecord, index: number): Transaction {
+  const color = ["#c7d9ff", "#b9e8d3", "#ffd8ac", "#e8c9ff", "#c3f0ef"][index % 5];
+  const type = record.status === "Refunded" ? "Refund" : record.status === "Declined" ? "Declined" : "Sale";
+  return {
+    ...record,
+    initials: "PP",
+    email: "Customer details not requested from PayPal",
+    type,
+    payout: "Transaction Search record",
+    color,
+  };
+}
+
 function formatCurrency(value: number) {
   return `${value < 0 ? "−" : ""}$${Math.abs(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
@@ -178,7 +219,7 @@ function RiskBadge({ risk }: { risk: RiskLevel }) {
 }
 
 function StatusBadge({ status }: { status: TransactionStatus }) {
-  const Icon = status === "Paid" ? Check : status === "Dispute" ? AlertTriangle : status === "Pending" ? Clock3 : RefreshCcw;
+  const Icon = status === "Paid" ? Check : status === "Dispute" || status === "Declined" ? AlertTriangle : status === "Pending" ? Clock3 : RefreshCcw;
   return (
     <span className={`status-badge status-${status.toLowerCase()}`}>
       <Icon size={12} /> {status}
@@ -219,23 +260,105 @@ function MiniChart() {
 }
 
 export default function Home() {
-  const [activeView, setActiveView] = useState<"Overview" | "Transactions" | "Insights">("Overview");
+  const demoMode = new URLSearchParams(window.location.search).get("demo");
+  const [activeView, setActiveView] = useState<"Overview" | "Transactions" | "Insights">(demoMode === "insights" ? "Insights" : "Overview");
   const [filter, setFilter] = useState<FilterKey>("all");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("any");
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
   const [selectedId, setSelectedId] = useState("tr_1048");
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(demoMode === "drawer" || demoMode === "success");
   const [actionKind, setActionKind] = useState<ActionKind>("refund");
-  const [actionState, setActionState] = useState<"idle" | "running" | "success">("idle");
+  const [actionState, setActionState] = useState<"idle" | "running" | "success">(demoMode === "success" ? "success" : "idle");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [connected, setConnected] = useState(true);
+  const [liveTransactions, setLiveTransactions] = useState<Transaction[] | null>(null);
+  const [availableBalance, setAvailableBalance] = useState<number | null>(null);
+  const [aiBrief, setAiBrief] = useState<LiveBrief | null>(null);
+  const [integrationError, setIntegrationError] = useState("");
+  const [integrationBusy, setIntegrationBusy] = useState<"sync" | "brief" | null>(null);
+  const [integrationStatus, setIntegrationStatus] = useState({ paypal: "unknown", ai: "unknown" });
 
-  const selectedTransaction = transactions.find((transaction) => transaction.id === selectedId) ?? transactions[0];
+  useEffect(() => {
+    if (!API_BASE_URL) return;
+    fetch(`${API_BASE_URL}/api/integrations/status`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error("FlowPilot API is unavailable.");
+        return response.json() as Promise<{ paypal: string; ai: string }>;
+      })
+      .then((status) => setIntegrationStatus(status))
+      .catch(() => setIntegrationError("The integration service is not reachable yet. Sample data remains available."));
+  }, []);
+
+  const activeTransactions = liveTransactions ?? transactions;
+
+  const selectedTransaction = activeTransactions.find((transaction) => transaction.id === selectedId) ?? activeTransactions[0] ?? transactions[0];
+
+  async function syncPayPal() {
+    if (!API_BASE_URL) {
+      setIntegrationError("The API service URL has not been configured for this site yet.");
+      return;
+    }
+    setIntegrationBusy("sync");
+    setIntegrationError("");
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/paypal/transactions?days=7`);
+      const payload = await response.json() as { error?: string; transactions?: SandboxRecord[]; availableBalance?: number | null };
+      if (!response.ok) throw new Error(payload.error ?? "Could not sync PayPal Sandbox activity.");
+      setLiveTransactions((payload.transactions ?? []).map(toTransaction));
+      setAvailableBalance(payload.availableBalance ?? null);
+      setIntegrationStatus((status) => ({ ...status, paypal: "configured" }));
+    } catch (error) {
+      setIntegrationError(error instanceof Error ? error.message : "Could not sync PayPal Sandbox activity.");
+    } finally {
+      setIntegrationBusy(null);
+    }
+  }
+
+  async function generateBrief() {
+    if (!API_BASE_URL) {
+      setIntegrationError("The API service URL has not been configured for this site yet.");
+      return;
+    }
+    setIntegrationBusy("brief");
+    setIntegrationError("");
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/brief`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ days: 7 }),
+      });
+      const payload = await response.json() as { error?: string; snapshot?: { transactions?: SandboxRecord[]; availableBalance?: number | null }; brief?: LiveBrief };
+      if (!response.ok) throw new Error(payload.error ?? "Could not generate the AI briefing.");
+      if (!payload.brief) throw new Error("The AI service returned no briefing.");
+      setAiBrief(payload.brief);
+      if (payload.snapshot) {
+        setLiveTransactions((payload.snapshot.transactions ?? []).map(toTransaction));
+        setAvailableBalance(payload.snapshot.availableBalance ?? null);
+      }
+      setIntegrationStatus({ paypal: "configured", ai: "configured" });
+      setActiveView("Overview");
+    } catch (error) {
+      setIntegrationError(error instanceof Error ? error.message : "Could not generate the AI briefing.");
+    } finally {
+      setIntegrationBusy(null);
+    }
+  }
 
   const filteredTransactions = useMemo(() => {
-    if (filter === "inflow") return transactions.filter((transaction) => transaction.amount > 0);
-    if (filter === "outflow") return transactions.filter((transaction) => transaction.amount < 0);
-    if (filter === "risk") return transactions.filter((transaction) => transaction.risk !== "Low");
-    return transactions;
-  }, [filter]);
+    const query = searchQuery.trim().toLowerCase();
+    return activeTransactions.filter((transaction) => {
+      const matchesDirection = filter === "all"
+        || (filter === "inflow" && transaction.amount > 0)
+        || (filter === "outflow" && transaction.amount < 0)
+        || (filter === "risk" && transaction.risk !== "Low");
+      const matchesStatus = statusFilter === "any"
+        || (statusFilter === "pending" && transaction.status === "Pending")
+        || (statusFilter === "attention" && (transaction.status === "Dispute" || transaction.risk === "Watch"))
+        || (statusFilter === "settled" && (transaction.status === "Paid" || transaction.status === "Refunded"));
+      const searchable = `${transaction.customer} ${transaction.email} ${transaction.id} ${transaction.item} ${transaction.status}`.toLowerCase();
+      return matchesDirection && matchesStatus && searchable.includes(query);
+    });
+  }, [activeTransactions, filter, searchQuery, statusFilter]);
 
   function selectTransaction(transaction: Transaction) {
     setSelectedId(transaction.id);
@@ -289,12 +412,11 @@ export default function Home() {
             );
           })}
           <p className="nav-label nav-label-spaced">Manage</p>
-          <button className="nav-item" onClick={() => setConnected((value) => !value)}><WalletCards size={17} strokeWidth={1.8} /><span>PayPal connection</span><span className={`connection-dot ${connected ? "online" : "offline"}`} /></button>
-          <button className="nav-item" onClick={() => alert("Team controls are coming in the live workspace.")}><Users size={17} strokeWidth={1.8} /><span>Team</span></button>
+          <button className="nav-item" onClick={() => { void syncPayPal(); setMobileNavOpen(false); }}><WalletCards size={17} strokeWidth={1.8} /><span>PayPal Sandbox</span><span className={`connection-dot ${liveTransactions ? "online" : "offline"}`} /></button>
         </nav>
 
-        <div className="sidebar-bottom">
-          <div className="pilot-status"><span className="pilot-status-dot" /><div><strong>AI pilot is on</strong><span>Watching 24 payments</span></div><MoreHorizontal size={15} /></div>
+          <div className="sidebar-bottom">
+          <div className="pilot-status"><span className="pilot-status-dot" /><div><strong>{liveTransactions ? "Sandbox data loaded" : "Sample data shown"}</strong><span>{liveTransactions ? `${liveTransactions.length} PayPal records` : "Connect keys to load PayPal"}</span></div><MoreHorizontal size={15} /></div>
           <button className="help-link"><HelpCircle size={16} /><span>Help center</span><span className="shortcut">?</span></button>
           <div className="user-row"><div className="user-avatar">SJ</div><div><strong>Sam Jordan</strong><span>Owner</span></div><MoreHorizontal size={16} /></div>
         </div>
@@ -305,16 +427,21 @@ export default function Home() {
       <main className="main-stage">
         <header className="topbar">
           <div className="topbar-left"><button className="mobile-menu mobile-only" onClick={() => setMobileNavOpen(true)} aria-label="Open navigation"><Menu size={20} /></button><div className="breadcrumb"><span>Northstar Studio</span><ChevronRight size={14} /><strong>{activeView}</strong></div></div>
-          <div className="topbar-actions"><div className="sync-label"><span className="sync-dot" /> Synced 2 min ago</div><button className="icon-button" title="Notifications"><Bell size={18} /></button><div className="topbar-avatar">SJ</div></div>
+          <div className="topbar-actions"><div className="sync-label"><span className="sync-dot" /> Sample dataset</div><button className="icon-button" title="Notifications"><Bell size={18} /></button><div className="topbar-avatar">SJ</div></div>
         </header>
 
         <div className="content-wrap">
           <section className="page-heading">
-            <div><div className="eyebrow"><span className="eyebrow-line" /> Thursday, October 31, 2026</div><h1>{isOverview ? "Good morning, Sam." : activeView}</h1><p>{isOverview ? "Here’s the money moment for Northstar Studio." : isTransactions ? "Every payment, refund, and dispute in one clear view." : "Your AI pilot’s read on what deserves attention next."}</p></div>
-            <div className="heading-actions"><button className="date-button"><CalendarClock size={16} /> Last 7 days <ChevronRight size={14} /></button><button className="primary-button" onClick={() => openAction("remind")}><Sparkles size={16} /> Ask FlowPilot</button></div>
+            <div><div className="eyebrow"><span className="eyebrow-line" /> {new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</div><h1>{isOverview ? "Good morning, Sam." : activeView}</h1><p>{isOverview ? "Here’s the money moment for Northstar Studio." : isTransactions ? "Every payment, refund, and dispute in one clear view." : "Your AI pilot’s read on what deserves attention next."}</p></div>
+            <div className="heading-actions"><button className="date-button"><CalendarClock size={16} /> Last 7 days <ChevronRight size={14} /></button><button className="primary-button" onClick={() => void generateBrief()} disabled={integrationBusy !== null}><Sparkles size={16} /> {integrationBusy === "brief" ? "Preparing brief…" : "Ask FlowPilot"}</button></div>
           </section>
 
-          <div className="connection-banner"><div className="banner-icon"><ShieldCheck size={17} /></div><div><strong>{connected ? "PayPal sandbox connected" : "PayPal sandbox paused"}</strong><span>{connected ? "Demo data is synced and ready for review." : "Reconnect to resume payment monitoring."}</span></div><button onClick={() => setConnected((value) => !value)}>{connected ? "Manage" : "Reconnect"}<ChevronRight size={14} /></button></div>
+          <div className="connection-banner"><div className="banner-icon"><ShieldCheck size={17} /></div><div><strong>{liveTransactions ? "PayPal Sandbox connected" : "Sample preview · PayPal Sandbox ready to connect"}</strong><span>{liveTransactions ? `${liveTransactions.length} real Sandbox records loaded${availableBalance === null ? "." : ` · Available balance ${formatCurrency(availableBalance)}.`}` : "The overview uses labeled sample data until Sandbox credentials are configured."}</span></div><button onClick={() => void syncPayPal()} disabled={integrationBusy !== null}>{integrationBusy === "sync" ? "Syncing…" : "Sync Sandbox"}<ChevronRight size={14} /></button></div>
+          <section className="integration-panel" aria-label="PayPal and AI integration status">
+            <div><strong>PayPal Sandbox</strong><span>{integrationStatus.paypal === "configured" ? "Credentials detected" : integrationStatus.paypal === "not_configured" ? "Add Sandbox app credentials in Render" : "Checking API connection"}</span></div>
+            <div><strong>AI briefing</strong><span>{aiBrief ? `${aiBrief.provider} · ${aiBrief.model}` : integrationStatus.ai === "configured" ? "OpenAI key detected" : integrationStatus.ai === "not_configured" ? "Add OpenAI key in Render" : "Checking API connection"}</span></div>
+            {integrationError && <p role="alert">{integrationError}</p>}
+          </section>
 
           {isOverview && <>
             <section className="metric-grid" aria-label="Key metrics">
@@ -326,12 +453,12 @@ export default function Home() {
 
             <section className="brief-grid">
               <article className="ai-brief-panel">
-                <div className="panel-heading"><div className="panel-title"><span className="ai-orb"><Sparkles size={15} /></span><div><span className="section-kicker">FlowPilot intelligence</span><h2>Your money, in plain English.</h2></div></div><span className="live-pill"><span /> Live</span></div>
-                <p className="brief-lede">I found <strong>3 moments</strong> worth your attention. Your cash position is healthy, but one dispute could delay tomorrow’s payout.</p>
-                <div className="insight-stack">
-                  <button className="insight-card insight-alert" onClick={() => selectTransaction(transactions[0])}><div className="insight-icon"><FileWarning size={17} /></div><div className="insight-content"><div className="insight-head"><strong>Dispute opened on $284 payment</strong><span>Now</span></div><p>Maya Chen’s payment is on hold. The account looks familiar, but the card country changed.</p><span className="insight-action">Review dispute <ChevronRight size={14} /></span></div></button>
-                  <button className="insight-card" onClick={() => selectTransaction(transactions[1])}><div className="insight-icon blue"><TrendingUp size={17} /></div><div className="insight-content"><div className="insight-head"><strong>Wholesale order is 4.2× your median</strong><span>8m ago</span></div><p>Northstar Goods is verified. Capture is safe, but I’d keep an eye on delivery confirmation.</p><span className="insight-action">View payment <ChevronRight size={14} /></span></div></button>
-                </div>
+                <div className="panel-heading"><div className="panel-title"><span className="ai-orb"><Sparkles size={15} /></span><div><span className="section-kicker">FlowPilot intelligence</span><h2>Your money, in plain English.</h2></div></div><span className="live-pill"><span /> {aiBrief ? "Live AI brief" : "Sample brief"}</span></div>
+                <p className="brief-lede">{aiBrief ? aiBrief.summary : <>Sample insight: <strong>3 moments</strong> are shown for demonstration. Connect PayPal Sandbox and OpenAI to generate a live analysis.</>}</p>
+                {aiBrief ? <div className="insight-stack">{aiBrief.insights.map((insight, index) => <article className="insight-card" key={`${insight.title}-${index}`}><div className={`insight-icon ${insight.priority === "high" ? "" : "blue"}`}><Sparkles size={17} /></div><div className="insight-content"><div className="insight-head"><strong>{insight.title}</strong><span>{insight.priority}</span></div><p>{insight.summary}</p><span className="insight-action">Suggested: {insight.recommendedAction} · review before acting</span></div></article>)}</div> : <div className="insight-stack">
+                  <button className="insight-card insight-alert" onClick={() => selectTransaction(activeTransactions[0])}><div className="insight-icon"><FileWarning size={17} /></div><div className="insight-content"><div className="insight-head"><strong>Dispute opened on $284 payment</strong><span>Sample</span></div><p>Illustrative dispute scenario shown with sample data. Use Sync Sandbox for account activity.</p><span className="insight-action">Review payment <ChevronRight size={14} /></span></div></button>
+                  <button className="insight-card" onClick={() => selectTransaction(activeTransactions[Math.min(1, activeTransactions.length - 1)])}><div className="insight-icon blue"><TrendingUp size={17} /></div><div className="insight-content"><div className="insight-head"><strong>Review a payment pattern</strong><span>Sample</span></div><p>Illustrative payment scenario. FlowPilot does not infer customer history from Sandbox records.</p><span className="insight-action">View payment <ChevronRight size={14} /></span></div></button>
+                </div>}
                 <button className="text-button" onClick={() => setActiveView("Insights")}>See all insights <ArrowUpRight size={14} /></button>
               </article>
 
@@ -343,12 +470,12 @@ export default function Home() {
             </section>
           </>}
 
-          {isInsights && <section className="insights-page"><div className="insights-hero"><div className="ai-orb large"><Sparkles size={24} /></div><div><span className="section-kicker">FlowPilot intelligence</span><h2>Three moments worth your attention.</h2><p>Reasoned from 24 PayPal payments, payout timing, and your recent customer patterns.</p></div></div><div className="insight-page-grid"><button className="insight-page-card alert-border" onClick={() => selectTransaction(transactions[0])}><span className="card-index">01</span><AlertTriangle size={19} /><h3>Protect tomorrow’s payout</h3><p>The $284 dispute from Maya Chen is the only item currently holding funds. Review the evidence before the dispute window closes.</p><span className="insight-action">Open payment <ChevronRight size={14} /></span></button><button className="insight-page-card blue-border" onClick={() => selectTransaction(transactions[1])}><span className="card-index">02</span><TrendingUp size={19} /><h3>Capture the wholesale order</h3><p>Northstar Goods is verified, and the $1,250 order matches a known business email. Capturing it keeps the payout forecast on track.</p><span className="insight-action">View order <ChevronRight size={14} /></span></button><button className="insight-page-card green-border" onClick={() => openAction("remind")}><span className="card-index">03</span><Send size={19} /><h3>Close the gentle follow-up</h3><p>Two customers viewed invoices but haven’t completed payment. Send a friendly reminder without changing the amount or due date.</p><span className="insight-action">Draft reminders <ChevronRight size={14} /></span></button></div></section>}
+          {isInsights && <section className="insights-page"><div className="insights-hero"><div className="ai-orb large"><Sparkles size={24} /></div><div><span className="section-kicker">FlowPilot intelligence</span><h2>{aiBrief ? "Your live cash-flow briefing." : "Generate an AI briefing."}</h2><p>{aiBrief ? aiBrief.summary : "Sync PayPal Sandbox and ask FlowPilot to analyze the available records."}</p></div><button className="primary-button" onClick={() => void generateBrief()} disabled={integrationBusy !== null}>{integrationBusy === "brief" ? "Preparing…" : "Ask FlowPilot"}</button></div><div className="insight-page-grid">{(aiBrief?.insights ?? []).map((insight, index) => <article className={`insight-page-card ${index === 0 ? "alert-border" : index === 1 ? "blue-border" : "green-border"}`} key={`${insight.title}-${index}`}><span className="card-index">{String(index + 1).padStart(2, "0")}</span><Sparkles size={19} /><h3>{insight.title}</h3><p>{insight.summary}</p><span className="insight-action">Suggested: {insight.recommendedAction} · human review</span></article>)}</div>{!aiBrief && <p className="integration-hint">Sample insights elsewhere in this workspace are labeled as demonstrations.</p>}</section>}
 
           {(isOverview || isTransactions) && <section className="transactions-section">
-            <div className="section-heading-row"><div><span className="section-kicker">Payment intelligence</span><h2>{isOverview ? "Recent activity" : "All transactions"}</h2><p>{isOverview ? "A clear view of where your money is moving." : "Search, filter, and act on PayPal activity."}</p></div><div className="table-actions"><div className="search-box"><Search size={15} /><input aria-label="Search transactions" placeholder="Search payments" /></div><button className="filter-button"><Filter size={15} /> Filter</button></div></div>
+            <div className="section-heading-row"><div><span className="section-kicker">Payment intelligence</span><h2>{isOverview ? "Recent activity" : "All transactions"}</h2><p>{isOverview ? "A clear view of where your money is moving." : "Search, filter, and act on PayPal activity."}</p></div><div className="table-actions"><div className="search-box"><Search size={15} /><input aria-label="Search transactions" placeholder="Search name, email, or payment" value={searchQuery} onChange={event => setSearchQuery(event.target.value)} />{searchQuery && <button className="search-clear" aria-label="Clear search" onClick={() => setSearchQuery("")}><X size={13} /></button>}</div><div className="filter-menu-wrap"><button className={`filter-button ${statusFilter !== "any" ? "filter-button-active" : ""}`} aria-expanded={filterOpen} onClick={() => setFilterOpen(value => !value)}><Filter size={15} /> Filter{statusFilter !== "any" && <span className="filter-count">1</span>}</button>{filterOpen && <div className="filter-menu" role="group" aria-label="Filter by payment status"><span className="filter-menu-title">Payment status</span>{([{ value: "any", label: "All statuses" }, { value: "pending", label: "Pending payments" }, { value: "attention", label: "Needs attention" }, { value: "settled", label: "Completed" }] as const).map(option => <button key={option.value} className={statusFilter === option.value ? "filter-option selected" : "filter-option"} onClick={() => { setStatusFilter(option.value); setFilterOpen(false); }}><span>{option.label}</span>{statusFilter === option.value && <Check size={14} />}</button>)}</div>}</div></div></div>
             <div className="filter-tabs" role="tablist" aria-label="Transaction filters"><button className={filter === "all" ? "filter-active" : ""} onClick={() => setFilter("all")}>All <span>24</span></button><button className={filter === "inflow" ? "filter-active" : ""} onClick={() => setFilter("inflow")}>Money in <span>21</span></button><button className={filter === "outflow" ? "filter-active" : ""} onClick={() => setFilter("outflow")}>Money out <span>3</span></button><button className={filter === "risk" ? "filter-active" : ""} onClick={() => setFilter("risk")}>Needs attention <span>3</span></button></div>
-            <div className="table-wrap"><table><thead><tr><th>Customer / payment</th><th>Amount</th><th>Status</th><th>Risk</th><th>Payout</th><th><span className="sr-only">Open</span></th></tr></thead><tbody>{filteredTransactions.map((transaction) => <tr key={transaction.id} className={selectedId === transaction.id ? "row-selected" : ""} onClick={() => selectTransaction(transaction)}><td><div className="customer-cell"><span className="customer-avatar" style={{ background: transaction.color }}>{transaction.initials}</span><div><strong>{transaction.customer}</strong><span>{transaction.item}</span></div></div></td><td><div className={`amount-cell ${transaction.amount < 0 ? "amount-out" : ""}`}>{transaction.amount > 0 && <ArrowDownRight size={13} />}{formatCurrency(transaction.amount)}<span>{transaction.date} · {transaction.time}</span></div></td><td><StatusBadge status={transaction.status} /></td><td><RiskBadge risk={transaction.risk} /></td><td><span className="payout-cell">{transaction.payout}</span></td><td><button className="row-open" aria-label={`Open ${transaction.customer}`} onClick={(event) => { event.stopPropagation(); selectTransaction(transaction); }}><ChevronRight size={16} /></button></td></tr>)}</tbody></table></div>
+            <div className="table-wrap"><table><thead><tr><th>Customer / payment</th><th>Amount</th><th>Status</th><th>Risk</th><th>Payout</th><th><span className="sr-only">Open</span></th></tr></thead><tbody>{filteredTransactions.length === 0 ? <tr><td colSpan={6} className="empty-results">No payments match these filters. Try another search or clear a filter.</td></tr> : filteredTransactions.map((transaction) => <tr key={transaction.id} className={selectedId === transaction.id ? "row-selected" : ""} onClick={() => selectTransaction(transaction)}><td><div className="customer-cell"><span className="customer-avatar" style={{ background: transaction.color }}>{transaction.initials}</span><div><strong>{transaction.customer}</strong><span>{transaction.item}</span></div></div></td><td><div className={`amount-cell ${transaction.amount < 0 ? "amount-out" : ""}`}>{transaction.amount > 0 && <ArrowDownRight size={13} />}{formatCurrency(transaction.amount)}<span>{transaction.date} · {transaction.time}</span></div></td><td><StatusBadge status={transaction.status} /></td><td><RiskBadge risk={transaction.risk} /></td><td><span className="payout-cell">{transaction.payout}</span></td><td><button className="row-open" aria-label={`Open ${transaction.customer}`} onClick={(event) => { event.stopPropagation(); selectTransaction(transaction); }}><ChevronRight size={16} /></button></td></tr>)}</tbody></table></div>
             <div className="table-footer"><span>Showing {filteredTransactions.length} of 24 payments</span><button className="text-button" onClick={() => setActiveView("Transactions")}>View full ledger <ArrowUpRight size={14} /></button></div>
           </section>}
         </div>
