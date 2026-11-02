@@ -10,23 +10,26 @@ export interface AIInsight {
 export interface AIBrief {
   summary: string;
   insights: AIInsight[];
-  provider: "OpenAI Responses API";
+  provider: "NVIDIA NIM";
   model: string;
 }
 
-interface ResponsesApiPayload {
-  output?: Array<{
-    type?: string;
-    content?: Array<{ type?: string; text?: string; refusal?: string }>;
-  }>;
+interface NVIDIAChatPayload {
+  choices?: Array<{ message?: { content?: string | null } }>;
+}
+
+const getNVIDIAKey = () => process.env.NVIDIA_API_KEY?.trim() || process.env.nvidia_api_key?.trim();
+
+export function isAIConfigured(): boolean {
+  return Boolean(getNVIDIAKey());
 }
 
 export async function generateCashFlowBrief(snapshot: PayPalSnapshot): Promise<AIBrief> {
-  const apiKey = process.env.OPENAI_API_KEY?.trim();
-  if (!apiKey) throw new Error("OpenAI is not configured. Add OPENAI_API_KEY to the FlowPilot API service.");
+  const apiKey = getNVIDIAKey();
+  if (!apiKey) throw new Error("NVIDIA AI is not configured. Add NVIDIA_API_KEY to the FlowPilot API service.");
 
-  const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
-  const response = await fetch("https://api.openai.com/v1/responses", {
+  const model = process.env.NVIDIA_MODEL?.trim() || "meta/llama-3.1-8b-instruct";
+  const response = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -34,78 +37,58 @@ export async function generateCashFlowBrief(snapshot: PayPalSnapshot): Promise<A
     },
     body: JSON.stringify({
       model,
-      store: false,
-      instructions: [
-        "You are FlowPilot, a cautious cash-flow copilot for a small business owner.",
-        "Analyze only the PayPal Sandbox transaction summary in the input.",
-        "Do not infer disputes, payout dates, fraud, customer identity, or account history unless the data explicitly contains it.",
-        "State uncertainty plainly. Recommend human review for declined or pending payments.",
-        "Return a short overall summary and up to three useful insights. Every recommended action is a suggestion only; do not imply money moved.",
-      ].join(" "),
-      input: JSON.stringify({
-        currency: snapshot.currency,
-        availableBalance: snapshot.availableBalance,
-        transactionCount: snapshot.transactions.length,
-        transactions: snapshot.transactions.map(({ id, amount, currency, status, item, date, risk }) => ({ id, amount, currency, status, item, date, risk })),
-      }),
-      text: {
-        format: {
-          type: "json_schema",
-          name: "flowpilot_cash_flow_brief",
-          strict: true,
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              summary: { type: "string" },
-              insights: {
-                type: "array",
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    title: { type: "string" },
-                    summary: { type: "string" },
-                    priority: { type: "string", enum: ["high", "medium", "low"] },
-                    recommendedAction: { type: "string", enum: ["review", "capture", "remind"] },
-                  },
-                  required: ["title", "summary", "priority", "recommendedAction"],
-                },
-              },
-            },
-            required: ["summary", "insights"],
-          },
+      temperature: 0.2,
+      max_tokens: 1100,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You are FlowPilot, a cautious cash-flow copilot for a small business owner.",
+            "Analyze only the PayPal Sandbox transaction summary in the input.",
+            "Do not infer disputes, payout dates, fraud, customer identity, or account history unless the data explicitly contains it.",
+            "State uncertainty plainly. Recommend human review for declined or pending payments.",
+            'Return only valid JSON with keys "summary" and "insights". Each insight must contain "title", "summary", "priority" (high, medium, or low), and "recommendedAction" (review, capture, or remind). Return at most three insights.',
+            "Every recommended action is a suggestion only; do not imply money moved.",
+          ].join(" "),
         },
-      },
+        {
+          role: "user",
+          content: JSON.stringify({
+            currency: snapshot.currency,
+            availableBalance: snapshot.availableBalance,
+            transactionCount: snapshot.transactions.length,
+            transactions: snapshot.transactions.map(({ id, amount, currency, status, item, date, risk }) => ({ id, amount, currency, status, item, date, risk })),
+          }),
+        },
+      ],
     }),
     signal: AbortSignal.timeout(25_000),
   });
 
   if (!response.ok) {
-    if (response.status === 401) throw new Error("OpenAI rejected the API key. Check OPENAI_API_KEY in Render.");
-    if (response.status === 429) throw new Error("OpenAI rate limit or account quota reached. Check API billing and try again.");
-    throw new Error("OpenAI could not generate the briefing. Check the model setting and API account.");
+    if (response.status === 401 || response.status === 403) throw new Error("NVIDIA rejected the API key. Check NVIDIA_API_KEY in Render.");
+    if (response.status === 429) throw new Error("NVIDIA rate limit or account quota reached. Check NVIDIA API access and try again.");
+    throw new Error("NVIDIA could not generate the briefing. Check NVIDIA_MODEL and API access.");
   }
 
-  const payload = await response.json() as ResponsesApiPayload;
-  const text = payload.output
-    ?.flatMap((item) => item.content ?? [])
-    .find((content) => content.type === "output_text")?.text;
-  if (!text) throw new Error("OpenAI returned no briefing text.");
+  const payload = await response.json() as NVIDIAChatPayload;
+  const text = payload.choices?.[0]?.message?.content;
+  if (!text) throw new Error("NVIDIA returned no briefing text.");
   let result: { summary?: unknown; insights?: unknown };
   try {
-    result = JSON.parse(text) as { summary?: unknown; insights?: unknown };
+    const json = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
+    result = JSON.parse(json) as { summary?: unknown; insights?: unknown };
   } catch {
-    throw new Error("OpenAI returned a briefing that could not be read. Try again.");
+    throw new Error("NVIDIA returned a briefing that could not be read. Try again.");
   }
   if (typeof result.summary !== "string" || !Array.isArray(result.insights)) {
-    throw new Error("OpenAI returned an incomplete briefing. Try again.");
+    throw new Error("NVIDIA returned an incomplete briefing. Try again.");
   }
 
   return {
     summary: result.summary,
     insights: result.insights as AIInsight[],
-    provider: "OpenAI Responses API",
+    provider: "NVIDIA NIM",
     model,
   };
 }

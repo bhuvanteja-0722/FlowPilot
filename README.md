@@ -40,7 +40,7 @@ Create a PayPal developer Sandbox REST app and set `PAYPAL_CLIENT_ID` and `PAYPA
 
 ## AI briefing
 
-Set `OPENAI_API_KEY` on the API server (optional `OPENAI_MODEL`, default `gpt-4o-mini`). The server calls the OpenAI Responses API with structured output, `store: false`, and a minimal transaction summary. It does not send customer email addresses. The prompt limits claims to the returned Sandbox records and labels every recommended action as a suggestion for human review. API usage may incur OpenAI charges.
+Set `NVIDIA_API_KEY` on the API server (optional `NVIDIA_MODEL`, default `meta/llama-3.1-8b-instruct`). The server calls NVIDIA NIM's OpenAI-compatible chat-completions endpoint and sends only a minimal transaction summary; it does not send customer email addresses. The prompt limits claims to returned Sandbox records and labels every recommended action as a suggestion for human review. API usage is subject to NVIDIA's account limits and pricing.
 
 ## Render deployment
 
@@ -53,8 +53,8 @@ Keep the existing static site URL for the frontend and create a separate **Free 
 | Health check path | `/api/health` |
 | `FLOWPILOT_ALLOWED_ORIGIN` | `https://flowpilot-78qr.onrender.com` |
 | `PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET` | PayPal Sandbox app credentials |
-| `OPENAI_API_KEY` | OpenAI API key |
-| `OPENAI_MODEL` | `gpt-4o-mini` (optional) |
+| `NVIDIA_API_KEY` | NVIDIA API key (the existing Render variable `nvidia_api_key` is also accepted) |
+| `NVIDIA_MODEL` | `meta/llama-3.1-8b-instruct` (optional) |
 
 On the existing Render Static Site, add `VITE_API_BASE_URL` with the API Web Service URL and redeploy the static site. The API URL is provided by Render when that service is created. Both services deploy from `main`; the API uses the free instance type. Free Web Services sleep after inactivity and the first request may take time to wake them. Keep all keys in Render's environment settings, never in Git.
 

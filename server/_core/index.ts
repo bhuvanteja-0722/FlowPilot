@@ -8,7 +8,7 @@ import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 import { fetchPayPalSnapshot, isPayPalConfigured } from "../integrations/paypal";
-import { generateCashFlowBrief } from "../integrations/ai";
+import { generateCashFlowBrief, isAIConfigured } from "../integrations/ai";
 
 async function startServer() {
   const app = express();
@@ -36,7 +36,7 @@ async function startServer() {
   app.get("/api/health", (_req, res) => res.json({ status: "ok", service: "flowpilot-api" }));
   app.get("/api/integrations/status", (_req, res) => res.json({
     paypal: isPayPalConfigured() ? "configured" : "not_configured",
-    ai: process.env.OPENAI_API_KEY?.trim() ? "configured" : "not_configured",
+    ai: isAIConfigured() ? "configured" : "not_configured",
   }));
   app.get("/api/paypal/transactions", async (req, res) => {
     const rawDays = Number(req.query.days ?? 7);
